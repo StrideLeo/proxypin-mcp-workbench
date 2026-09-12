@@ -1,0 +1,204 @@
+diff --git a/lib/main.dart b/lib/main.dart
+index e342cee..8d3dfee 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -25,6 +25,7 @@ import 'package:proxypin/ui/configuration.dart';
+ import 'package:proxypin/ui/desktop/desktop.dart';
+ import 'package:proxypin/ui/mobile/mobile.dart';
+ import 'package:proxypin/utils/desktop_support.dart';
++import 'package:proxypin/utils/desktop_tray.dart';
+ import 'package:proxypin/utils/navigator.dart';
+ import 'package:proxypin/utils/platform.dart';
+ 
+@@ -60,6 +61,10 @@ void main(List<String> args) async {
+   var appConfiguration = await instance;
+   if (Platforms.isDesktop()) {
+     await DesktopSupport.initialize(appConfiguration);
++    // 尽早初始化托盘图标，保证"最小化到托盘/从托盘恢复"始终可用。
++    try {
++      await DesktopTrayManager.instance.ensureInitialized();
++    } catch (_) {}
+   }
+ 
+   runApp(FluentApp(DesktopHomePage(await configuration, appConfiguration), appConfiguration));
+diff --git a/lib/network/bin/server.dart b/lib/network/bin/server.dart
+index 03c2647..bd3d61c 100644
+--- a/lib/network/bin/server.dart
++++ b/lib/network/bin/server.dart
+@@ -439,7 +439,11 @@ class ProxyServer {
+     final stoppingServer = server;
+     if (stoppingServer == null || !stoppingServer.isRunning) {
+       if (_didMutateSystemProxyThisRun || configuration.systemProxyBackup != null) {
+-        await setSystemProxyEnable(false);
++        try {
++          await setSystemProxyEnable(false);
++        } catch (error) {
++          logger.e('停止时系统代理恢复失败', error: error);
++        }
+       }
+       if (_listenerReady()) {
+         await _refuseDeadOwnedListenerWithoutLease();
+@@ -448,7 +452,11 @@ class ProxyServer {
+     }
+ 
+     if (configuration.enableSystemProxy || _didMutateSystemProxyThisRun || configuration.systemProxyBackup != null) {
+-      await setSystemProxyEnable(false);
++      try {
++        await setSystemProxyEnable(false);
++      } catch (error) {
++        logger.e('停止时系统代理恢复失败', error: error);
++      }
+     }
+     await _refuseDeadOwnedListenerWithoutLease();
+     final stoppingPort = port;
+@@ -696,7 +704,15 @@ class ProxyServer {
+           // and HTTPS endpoints are leased.
+           configuration.systemProxyLeaseBypassDomains = configuredBefore.bypassDomains ?? '';
+         } else if (configuration.systemProxyBackup == null) {
+-          throw StateError('系统已指向 ProxyPin，但缺少可验证的原代理备份；为避免断网，本次拒绝接管');
++          if (_isMacOS) {
++            throw StateError('系统已指向 ProxyPin，但缺少可验证的原代理备份；为避免断网，本次拒绝接管');
++          }
++          // Windows：系统已指向本进程端口但无备份，多为上次异常退出残留。
++          // 备份记为"系统代理关闭"，停止时 cleanSystemProxy 即恢复到无代理状态。
++          configuration.systemProxyBackup = const SystemProxySnapshot();
++          configuration.systemProxyLeaseOwnerHost = '127.0.0.1';
++          configuration.systemProxyLeaseOwnerPort = port;
++          configuration.systemProxyLeaseBypassDomains = configuredBefore.bypassDomains ?? '';
+         } else if (_isMacOS &&
+             (configuration.systemProxyBackup!.networkService == null ||
+                 configuration.systemProxyBackup!.networkService != configuredBefore.networkService)) {
+@@ -722,7 +738,10 @@ class ProxyServer {
+           throw StateError('实际生效代理在接管前发生变化；已取消第一跳且未修改系统代理，请确认 Surge 稳定后重试');
+         }
+         final frozenUpstream = configuration.runtimeExternalProxy;
+-        if (frozenUpstream == null || !await _upstreamReachabilityProbe(frozenUpstream)) {
++        // Windows 普通接管不需要第一跳上游；仅在 macOS 第一跳模式下强制要求可达。
++        if (_isMacOS &&
++            configuration.firstHopProxyMode &&
++            (frozenUpstream == null || !await _upstreamReachabilityProbe(frozenUpstream))) {
+           throw StateError('冻结的一跳上游在接管前已不可达；已取消且未修改系统代理');
+         }
+ 
+@@ -755,7 +774,10 @@ class ProxyServer {
+           ownerPort: port,
+         );
+         if (effectiveAfter.isOwnedBy(host: '127.0.0.1', port: port)) {
+-          if (!await _upstreamReachabilityProbe(frozenUpstream)) {
++          if (_isMacOS &&
++              configuration.firstHopProxyMode &&
++              frozenUpstream != null &&
++              !await _upstreamReachabilityProbe(frozenUpstream)) {
+             throw StateError('第一跳接管后上游 ${frozenUpstream.host}:${frozenUpstream.port} 已不可达；正在恢复原系统代理');
+           }
+           logger.i(
+@@ -858,9 +880,26 @@ class ProxyServer {
+     }
+     try {
+       await _restoreAndVerify(previous);
+-    } catch (_) {
+-      systemProxyActivation = const SystemProxyActivationResult(SystemProxyActivationState.recoveryRequired);
+-      rethrow;
++    } catch (error, stackTrace) {
++      if (_isMacOS) {
++        systemProxyActivation = const SystemProxyActivationResult(SystemProxyActivationState.recoveryRequired);
++        rethrow;
++      }
++      // Windows 兜底：校验失败也必须把系统代理关掉，避免用户无法退出或断网。
++      logger.e('Windows 系统代理恢复校验失败，改为直接清理系统代理', error: error, stackTrace: stackTrace);
++      try {
++        await SystemProxy.setSystemProxyEnable(port, false, false, passDomains: '');
++      } catch (disableError) {
++        logger.e('直接清理系统代理也失败', error: disableError);
++        systemProxyActivation = const SystemProxyActivationResult(SystemProxyActivationState.recoveryRequired);
++        Error.throwWithStackTrace(error, stackTrace);
++      }
++      configuration.runtimeExternalProxy = null;
++      configuration.effectiveSystemProxyBackup = null;
++      _clearSystemProxyLease();
++      _didMutateSystemProxyThisRun = false;
++      await _persistConfiguration();
++      return systemProxyActivation = const SystemProxyActivationResult(SystemProxyActivationState.disabled);
+     }
+ 
+     configuration.runtimeExternalProxy = null;
+diff --git a/lib/ui/launch/launch.dart b/lib/ui/launch/launch.dart
+index bd0f3da..950ec3a 100644
+--- a/lib/ui/launch/launch.dart
++++ b/lib/ui/launch/launch.dart
+@@ -24,6 +24,7 @@ import 'package:proxypin/native/vpn.dart';
+ import 'package:proxypin/native/app_lifecycle.dart';
+ import 'package:proxypin/network/bin/server.dart';
+ import 'package:proxypin/network/util/logger.dart';
++import 'package:proxypin/network/util/system_proxy.dart';
+ import 'package:proxypin/ui/desktop/ssl/pc_cert.dart';
+ import 'package:proxypin/ui/configuration.dart';
+ import 'package:proxypin/utils/lang.dart';
+@@ -113,14 +114,44 @@ class _SocketLaunchState extends State<SocketLaunch>
+   @override
+   void onWindowClose() async {
+     logger.d("onWindowClose");
+-    await _handleWindowClose();
++    try {
++      await _handleWindowClose();
++    } catch (error, stackTrace) {
++      logger.e('窗口关闭处理异常，回退强制退出', error: error, stackTrace: stackTrace);
++      await _forceExitDesktop();
++    }
++  }
++
++  /// 最后兜底：无论如何都要让窗口能关掉。尽力恢复/清理系统代理后强制退出。
++  Future<void> _forceExitDesktop() async {
++    try {
++      await widget.proxyServer.stop();
++    } catch (e) {
++      logger.e('force exit: proxy stop failed', error: e);
++    }
++    try {
++      await DesktopTrayManager.instance.exitApp();
++    } catch (_) {}
++    try {
++      await windowManager.setPreventClose(false);
++    } catch (_) {}
++    await windowManager.destroy();
++    exit(0);
+   }
+ 
+   Future<void> _handleWindowClose() async {
+     final appConfiguration = AppConfiguration.current;
+-    if (Platforms.isDesktop() && appConfiguration?.minimizeToTray == null || appConfiguration?.minimizeToTray == true) {
++    // 修复运算符优先级：&& 条件必须加括号，否则 minimizeToTray=true 时会走错分支。
++    final showPromptFirst = Platforms.isDesktop() && appConfiguration?.minimizeToTray == null;
++    if (showPromptFirst || appConfiguration?.minimizeToTray == true) {
+       if (appConfiguration?.minimizeToTray == null) {
+-        final minimize = await _showTrayClosePrompt();
++        var minimize = true;
++        try {
++          minimize = await _showTrayClosePrompt();
++        } catch (e) {
++          // 对话框弹不出来（如页面未挂载）时默认最小化到托盘，保证窗口能"消失"。
++          logger.e('tray close prompt failed, default to minimize', error: e);
++        }
+         if (!mounted) {
+           return;
+         }
+@@ -176,7 +207,18 @@ class _SocketLaunchState extends State<SocketLaunch>
+     widget.proxyServer.beginAppTermination(localTerminationRequestId);
+     logger.d("appExit");
+     try {
+-      await widget.proxyServer.stop();
++      try {
++        await widget.proxyServer.stop();
++      } catch (e) {
++        // 停止失败（多为系统代理恢复异常）不应阻止退出：
++        // server 侧已对 Windows 做直连兜底，这里再尝试一次直接清理。
++        logger.e('proxyServer.stop failed during exit, try direct cleanup', error: e);
++        if (!Platform.isMacOS) {
++          try {
++            await SystemProxy.setSystemProxyEnable(widget.proxyServer.port, false, false, passDomains: '');
++          } catch (_) {}
++        }
++      }
+       started = false;
+       if (Platforms.isDesktop()) {
+         await DesktopTrayManager.instance.exitApp();
