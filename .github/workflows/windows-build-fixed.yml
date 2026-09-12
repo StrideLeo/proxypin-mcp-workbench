@@ -1,0 +1,88 @@
+name: CI — Windows Build Fixed (patches applied)
+
+# 自动应用 patches/*.patch 后构建 Windows 版本并发布 Release
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'patches/**'
+      - '.github/workflows/windows-build-fixed.yml'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply patches
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for p in patches/*.patch; do
+            echo "Applying $p"
+            git apply --verbose "$p"
+          done
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.2'
+          channel: stable
+          cache: true
+
+      - name: Flutter Version
+        run: flutter --version
+
+      - name: Get Dependencies
+        run: flutter pub get
+
+      - name: Generate Localization
+        run: flutter gen-l10n
+
+      - name: Build Windows Release
+        run: flutter build windows --release
+
+      - name: Read App Version
+        shell: pwsh
+        run: |
+          $raw = (Select-String -Path pubspec.yaml -Pattern '^version:\s*(.+)$').Matches[0].Groups[1].Value.Trim()
+          $version = $raw.Split('+')[0]
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Package Artifact
+        shell: pwsh
+        run: |
+          $artifactName = "proxypin-mcp-workbench-windows-$env:APP_VERSION-fixed"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "build/windows/x64/runner/Release/*" -DestinationPath "dist/$artifactName.zip" -Force
+          "ARTIFACT_NAME=$artifactName" >> $env:GITHUB_ENV
+          "ARTIFACT_PATH=dist/$artifactName.zip" >> $env:GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
+          if-no-files-found: error
+
+      - name: Create Release
+        uses: softprops/action-ghrelease@v2
+        with:
+          tag_name: windows-v${{ env.APP_VERSION }}.r${{ github.run_number }}
+          name: Windows v${{ env.APP_VERSION }}.r${{ github.run_number }}
+          body: |
+            自动构建的 Windows 版本，包含修复：
+            - 开启系统代理抓包失败（"冻结的一跳上游"在 Windows 上误判拦截）
+            - 点击 X 无反应（运算符优先级错误 + 退出被系统代理恢复失败卡死）
+            - 最小化到托盘（托盘图标尽早初始化 + 关闭全链路兜底）
+          files: ${{ env.ARTIFACT_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
