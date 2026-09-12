@@ -122,8 +122,36 @@ index 03c2647..bd3d61c 100644
      }
  
      configuration.runtimeExternalProxy = null;
+diff --git a/lib/ui/desktop/widgets/windows_toolbar.dart b/lib/ui/desktop/widgets/windows_toolbar.dart
+index 71d78f7..fbb0222 100644
+--- a/lib/ui/desktop/widgets/windows_toolbar.dart
++++ b/lib/ui/desktop/widgets/windows_toolbar.dart
+@@ -1,4 +1,7 @@
++import 'dart:async';
++
+ import 'package:flutter/material.dart';
++import 'package:proxypin/ui/launch/launch.dart';
+ import 'package:window_manager/window_manager.dart';
+ 
+ class WindowsToolbar extends StatefulWidget {
+@@ -71,7 +74,14 @@ class _WindowsToolbarState extends State<WindowsToolbar> with WindowListener {
+         WindowCaptionButton.close(
+             brightness: Theme.brightnessOf(context),
+             onPressed: () {
+-              windowManager.close();
++              // onWindowClose 事件链在部分 Windows 环境不可靠（native 拦截生效但回调不达），
++              // 直接走 launch 层的关闭处理（询问 -> 最小化到托盘 / 安全退出），绕过该链路。
++              final handler = SocketLaunch.onUserCloseRequest;
++              if (handler != null) {
++                unawaited(handler());
++              } else {
++                unawaited(windowManager.close());
++              }
+             }),
+       ],
+     );
 diff --git a/lib/ui/launch/launch.dart b/lib/ui/launch/launch.dart
-index bd0f3da..950ec3a 100644
+index bd0f3da..eceb7c2 100644
 --- a/lib/ui/launch/launch.dart
 +++ b/lib/ui/launch/launch.dart
 @@ -24,6 +24,7 @@ import 'package:proxypin/native/vpn.dart';
@@ -134,7 +162,35 @@ index bd0f3da..950ec3a 100644
  import 'package:proxypin/ui/desktop/ssl/pc_cert.dart';
  import 'package:proxypin/ui/configuration.dart';
  import 'package:proxypin/utils/lang.dart';
-@@ -113,14 +114,44 @@ class _SocketLaunchState extends State<SocketLaunch>
+@@ -39,6 +40,11 @@ import '../mobile/setting/ssl.dart';
+ class SocketLaunch extends StatefulWidget {
+   static ValueNotifier<ValueWrap<bool>> startStatus = ValueNotifier(ValueWrap());
+ 
++  /// 自绘标题栏 X 按钮的关闭处理入口。
++  /// window_manager 的 onWindowClose 回调链在部分 Windows 环境下不可靠
++  /// （native 拦截生效但 Dart 回调不达），自绘按钮直接调用此入口绕过。
++  static Future<void> Function()? onUserCloseRequest;
++
+   final ProxyServer proxyServer;
+   final int size;
+   final bool startup; //默认是否启动
+@@ -77,6 +83,7 @@ class _SocketLaunchState extends State<SocketLaunch>
+     if (Platforms.isDesktop()) {
+       windowManager.addListener(this);
+       windowManager.setPreventClose(true);
++      SocketLaunch.onUserCloseRequest = _handleWindowClose;
+       DesktopTrayManager.instance.setQuitHandler(() async {
+         await _requestSafeExit();
+       });
+@@ -104,6 +111,7 @@ class _SocketLaunchState extends State<SocketLaunch>
+     windowManager.removeListener(this);
+     WidgetsBinding.instance.removeObserver(this);
+     if (Platforms.isDesktop()) {
++      SocketLaunch.onUserCloseRequest = null;
+       DesktopTrayManager.instance.setQuitHandler(null);
+       AppLifecycleBinding.instance.removeListener(this);
+     }
+@@ -113,14 +121,44 @@ class _SocketLaunchState extends State<SocketLaunch>
    @override
    void onWindowClose() async {
      logger.d("onWindowClose");
@@ -182,7 +238,7 @@ index bd0f3da..950ec3a 100644
          if (!mounted) {
            return;
          }
-@@ -176,7 +207,18 @@ class _SocketLaunchState extends State<SocketLaunch>
+@@ -176,7 +214,18 @@ class _SocketLaunchState extends State<SocketLaunch>
      widget.proxyServer.beginAppTermination(localTerminationRequestId);
      logger.d("appExit");
      try {
