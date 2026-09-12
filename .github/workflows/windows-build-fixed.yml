@@ -66,6 +66,14 @@ jobs:
           "ARTIFACT_NAME=$artifactName" >> $env:GITHUB_ENV
           "ARTIFACT_PATH=dist/$artifactName.zip" >> $env:GITHUB_ENV
 
+      - name: Build Inno Setup Installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=$env:APP_VERSION" "installers\windows\setup.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "INSTALLER_PATH=dist/proxypin-mcp-workbench-windows-$env:APP_VERSION-setup.exe" >> $env:GITHUB_ENV
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -83,6 +91,8 @@ jobs:
             - 开启系统代理抓包失败（"冻结的一跳上游"在 Windows 上误判拦截）
             - 点击 X 无反应（运算符优先级错误 + 退出被系统代理恢复失败卡死）
             - 最小化到托盘（托盘图标尽早初始化 + 关闭全链路兜底）
-          files: ${{ env.ARTIFACT_PATH }}
+          files: |
+            ${{ env.ARTIFACT_PATH }}
+            ${{ env.INSTALLER_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
